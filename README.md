@@ -12,7 +12,9 @@ This factory eliminates boilerplate, ensures zero-conflict data storage, and pro
 
 - **Isolated Stores**: Creates a unique, independent IndexedDB database for every store instance (`createIDBStore`), guaranteeing zero data interference between different application modules (e.g., 'contacts' vs. 'users').
 
-- **Automatic Live Sync**: The `useRecords` hook uses Dexie's `liveQuery` to automatically update your components whenever data changes in the database.
+- **Automatic Live Sync & Tab Sync**: The `useRecords` hook uses Dexie's `liveQuery` to automatically update your components whenever data changes in the database, including **real-time synchronization across multiple browser tabs or windows** (Tab Sync).
+
+- **Powerful Imperative Reads**: Supports fast, single-use data fetching with **`findFirst`**, **`findLast`**, and **`findMany`** for scenarios outside of React components.
 
 - **Smart Performance**: Implements deep equality checks at the subscription level to prevent unnecessary React re-renders when the fetched data is content-identical to the previous state.
 
@@ -177,3 +179,37 @@ The `createIDBStore<StoreSchema>(definition)` factory returns an object with the
 | Type                 | Structure                                                | Description                                                    |
 | :------------------- | :------------------------------------------------------- | :------------------------------------------------------------- |
 | **`WhereClause<T>`** | `{ key: value }`, `{ $and: [...] }`, or `{ $or: [...] }` | The strongly typed query object used in the `useRecords` hook. |
+
+### API Reference
+
+The `createIDBStore<StoreSchema>(definition)` factory returns an object with the following interface:
+
+##### I. Read Hook (Reactive)
+
+| Function         | Signature                | Description                                                                                                                                                                  |
+| :--------------- | :----------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`useRecords`** | `({ where?, onError? })` | **Live Hook:** Returns `StoreRecord<StoreSchema>[]`. Subscribes to collection changes, applies filtering, and uses smart comparison to prevent unnecessary React re-renders. |
+
+##### II. Read Operations (Async)
+
+| Function        | Signature                 | Description                                                                                                                   |
+| :-------------- | :------------------------ | :---------------------------------------------------------------------------------------------------------------------------- |
+| **`findFirst`** | `(where: WhereClause<T>)` | Returns the **first** record (lowest ID) matching the criteria. Optimized with a forward cursor, stopping on the first match. |
+| **`findLast`**  | `(where: WhereClause<T>)` | Returns the **last** record (highest ID) matching the criteria. Optimized with a reverse cursor, stopping on the first match. |
+| **`findMany`**  | `(where: WhereClause<T>)` | Returns **all** records matching the criteria. Useful for imperative data fetching outside of components.                     |
+
+##### III. Write Operations (Async)
+
+| Operation        | Signature                                                     | Notes                                                                 |
+| :--------------- | :------------------------------------------------------------ | :-------------------------------------------------------------------- |
+| **`addItem`**    | `(item: T)`                                                   | Adds a single new item. Returns the new item's `id`.                  |
+| **`addMany`**    | `(items: T[])`                                                | High-performance bulk insert. Returns the key of the last added item. |
+| **`updateItem`** | `(id: number, update: Partial<T> \| (prev: T) => Partial<T>)` | Supports partial object updates or function-based state transitions.  |
+| **`deleteItem`** | `(id: number)`                                                | Deletes a single record by primary key.                               |
+| **`deleteMany`** | `(ids: number[])`                                             | High-performance bulk delete.                                         |
+
+##### IV. Query Types
+
+| Type                 | Structure                                                | Description                                                                             |
+| :------------------- | :------------------------------------------------------- | :-------------------------------------------------------------------------------------- |
+| **`WhereClause<T>`** | `{ key: value }`, `{ $and: [...] }`, or `{ $or: [...] }` | The strongly typed query object used in the `useRecords` and imperative read functions. |

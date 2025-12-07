@@ -18,11 +18,19 @@ type DeepPartial<T> = T extends object
     }
   : T;
 
-type StoreRecord<StoreSchema> = {
+/**
+ * The structure of a record as stored in IndexedDB (includes the auto-incremented id).
+ */
+export type StoreRecord<StoreSchema> = {
   id: number;
   object: StoreSchema;
 };
 
+/**
+ * Recursively sorts object keys for deterministic JSON string comparison.
+ * @param obj The object to sort.
+ * @returns An object with sorted keys.
+ */
 const sortObjectKeys = (obj: any): any => {
   if (typeof obj !== "object" || obj === null) return obj;
   if (Array.isArray(obj)) return obj.map(sortObjectKeys);
@@ -35,6 +43,13 @@ const sortObjectKeys = (obj: any): any => {
   return sortedObject;
 };
 
+/**
+ * Performs a robust deep comparison of two objects by standardizing and stringifying their JSON structure.
+ * This is used to prevent unnecessary React re-renders.
+ * @param a The first object.
+ * @param b The second object.
+ * @returns True if the contents are identical, regardless of key order.
+ */
 export function robustJsonCompare(a: any, b: any): boolean {
   if (a === b) return true;
   try {
@@ -46,6 +61,10 @@ export function robustJsonCompare(a: any, b: any): boolean {
   }
 }
 
+/**
+ * Evaluates a WhereClause condition against a single record payload.
+ * Supports nested equality, $and, and $or logic.
+ */
 function evaluateCondition<StoreSchema>(
   itemPayload: StoreSchema,
   condition: WhereClause<StoreSchema> | EqualityCondition<StoreSchema>
@@ -93,6 +112,9 @@ function evaluateCondition<StoreSchema>(
   return true;
 }
 
+/**
+ * Creates an isolated, type-safe data store based on Dexie (IndexedDB).
+ */
 export function createIDBStore<StoreSchema = any>(definition: {
   name: string;
   version?: number;
@@ -109,6 +131,81 @@ export function createIDBStore<StoreSchema = any>(definition: {
     name
   ];
 
+  /**
+   * Finds the first record (lowest ID) matching the WhereClause criteria.
+   * Uses the forward cursor and stops immediately on the first match.
+   * @param where The filtering criteria (WhereClause<StoreSchema>).
+   * @returns A Promise that resolves to the first matching StoreRecord, or undefined.
+   */
+  const findFirst = async (where: WhereClause<StoreSchema>) => {
+    try {
+      // Start forward cursor scan (lowest ID first)
+      const matchingRecord = await collection
+        .toCollection()
+        .filter((item) => {
+          return evaluateCondition(item.object, where);
+        })
+        .first();
+
+      return matchingRecord;
+    } catch (err) {
+      console.error(`Failed to find first in ${name}`);
+      throw err;
+    }
+  };
+
+  /**
+   * Finds the last record (highest ID) matching the WhereClause criteria.
+   * This is optimized by using a reverse cursor scan on the primary key, stopping immediately on the first match.
+   * @param where The filtering criteria (WhereClause<StoreSchema>).
+   * @returns A Promise that resolves to the last matching StoreRecord, or undefined.
+   */
+  const findLast = async (where: WhereClause<StoreSchema>) => {
+    try {
+      // Start reverse cursor scan (highest ID first)
+      const matchingRecord = await collection
+        .toCollection()
+        .reverse()
+        .filter((item) => {
+          return evaluateCondition(item.object, where);
+        })
+        .first();
+
+      return matchingRecord;
+    } catch (err) {
+      console.error(`Failed to find last in ${name}`);
+      throw err;
+    }
+  };
+
+  /**
+   * Finds all records matching the WhereClause criteria.
+   * Iterates the full collection and returns all matching records.
+   * @param where The filtering criteria (WhereClause<StoreSchema>).
+   * @returns A Promise that resolves to an array of matching StoreRecords.
+   */
+  const findMany = async (where: WhereClause<StoreSchema>) => {
+    try {
+      // Get all records and apply the client-side filter.
+      const matchingRecords = await collection
+        .toCollection()
+        .filter((item) => {
+          return evaluateCondition(item.object, where);
+        })
+        .toArray();
+
+      return matchingRecords;
+    } catch (err) {
+      console.error(`Failed to find many in ${name}`);
+      throw err;
+    }
+  };
+
+  /**
+   * Adds a single item to the store.
+   * @param item The StoreSchema object to add.
+   * @returns A Promise that resolves to the primary key (ID) of the new item.
+   */
   const addItem = async (item: StoreSchema) => {
     // @ts-expect-error
     const data: StoreRecord<StoreSchema> = { object: item };
@@ -120,6 +217,11 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
+  /**
+   * Adds multiple items to the store in a single transaction.
+   * @param items An array of StoreSchema objects to add.
+   * @returns A Promise that resolves to the primary key (ID) of the last added item.
+   */
   const addMany = async (items: StoreSchema[]) => {
     try {
       // @ts-expect-error
@@ -138,6 +240,11 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
+  /**
+   * Deletes a single item using its primary key (ID).
+   * @param id The primary key (ID) of the item to delete.
+   * @returns A Promise that resolves when the deletion is complete (void).
+   */
   const deleteItem = async (id: number) => {
     try {
       await collection.delete(id);
@@ -147,6 +254,11 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
+  /**
+   * Deletes multiple items using their primary keys (IDs) in a single transaction.
+   * @param ids An array of primary keys (IDs) to delete.
+   * @returns A Promise that resolves when the bulk deletion is complete (void).
+   */
   const deleteMany = async (ids: number[]) => {
     try {
       await collection.bulkDelete(ids);
@@ -159,6 +271,12 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
+  /**
+   * Updates a record by its primary key (ID) using a partial update or a state function.
+   * @param id The primary key (ID) of the item to update.
+   * @param update The partial StoreSchema object or a function that receives the previous value.
+   * @returns A Promise that resolves to 1 (success) or throws on failure.
+   */
   const updateItem = async (
     id: number,
     update:
@@ -185,6 +303,12 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
+  /**
+   * A React hook that subscribes to live record changes based on filter criteria.
+   * @param where Optional filtering criteria using WhereClause<StoreSchema> ($and, $or supported).
+   * @param onError Optional error handler for liveQuery subscription failures.
+   * @returns An array of matching StoreRecords ({ id, object }).
+   */
   const useRecords = ({
     where,
     onError,
@@ -254,6 +378,9 @@ export function createIDBStore<StoreSchema = any>(definition: {
 
   return {
     addItem,
+    findMany,
+    findFirst,
+    findLast,
     updateItem,
     deleteItem,
     deleteMany,
