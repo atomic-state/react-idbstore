@@ -20,6 +20,44 @@ This factory eliminates boilerplate, ensures zero-conflict data storage, and pro
 
 - **Full Type Safety**: Built with TypeScript, ensuring all CRUD operations and query parameters (`WhereClause<T>`) strictly adhere to your defined schema.
 
+### Data Relationships & The Isolation Trade-Off ⚠️
+
+The architecture of `react-idbstore` prioritizes **isolation and reusability** by creating a separate IndexedDB database for every store instance.
+
+##### No Native Joins
+
+Because each store is a physically separate database, **native database-level joins (like SQL JOINs or Dexie’s link queries) are not possible**. IndexedDB transactions cannot span across multiple databases.
+
+This is a conscious trade-off that offers significant benefits:
+
+| Con (Trade-Off)             | Pro (Benefit)                                                                                                                          |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------------------------------- |
+| **No Native Joins**         | **Absolute Data Isolation:** Zero risk of schema or data conflicts between application modules.                                        |
+| **Multiple Reads Required** | **Modular Simplicity:** Easy schema maintenance and component-level fetching (only fetch the related data you need, when you need it). |
+
+#### Handling Related Data (Client-Side Joining)
+
+To link data, fetch related records in parallel and combine them in your component's logic.
+
+**Example: Linking a Post and its Author**
+
+```tsx
+import { PostStore, UserStore } from './stores';
+
+function PostDetail({ postId }) {
+  // 1. Fetch the primary record
+  const post = PostStore.useRecords({ where: { id: postId } })?.[0];
+
+  // 2. Fetch the related record using the FK (post.object.authorId)
+  const author = UserStore.useRecords({ where: { id: post?.object.authorId } })?.[0];
+
+  return (
+    // ... render combined data ...
+  );
+}
+
+```
+
 ### Installation & Setup
 
 ##### Start by installing `react-idbstore`:
