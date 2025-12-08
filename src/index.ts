@@ -27,6 +27,24 @@ export type StoreRecord<StoreSchema> = {
 };
 
 /**
+ * The payload type for the bulk update by internal ID method.
+ */
+type InternalUpdatePayload<StoreSchema> = Array<{
+  id: number;
+  changes: Partial<StoreSchema>;
+}>;
+
+/**
+ * The payload type for the bulk update by external key method.
+ * Uses the simplified 'key' and 'value' fields.
+ */
+type ExternalUpdatePayload<StoreSchema> = Array<{
+  key: keyof StoreSchema;
+  value: any;
+  changes: Partial<StoreSchema>;
+}>;
+
+/**
  * Recursively sorts object keys for deterministic JSON string comparison.
  * @param obj The object to sort.
  * @returns An object with sorted keys.
@@ -149,7 +167,7 @@ export function createIDBStore<StoreSchema = any>(definition: {
 
       return matchingRecord;
     } catch (err) {
-      console.error(`Failed to find first in ${name}`);
+      console.error(`Failed to find first in ${name}:`, err);
       throw err;
     }
   };
@@ -173,7 +191,7 @@ export function createIDBStore<StoreSchema = any>(definition: {
 
       return matchingRecord;
     } catch (err) {
-      console.error(`Failed to find last in ${name}`);
+      console.error(`Failed to find last in ${name}:`, err);
       throw err;
     }
   };
@@ -196,7 +214,7 @@ export function createIDBStore<StoreSchema = any>(definition: {
 
       return matchingRecords;
     } catch (err) {
-      console.error(`Failed to find many in ${name}`);
+      console.error(`Failed to find many in ${name}:`, err);
       throw err;
     }
   };
@@ -298,7 +316,113 @@ export function createIDBStore<StoreSchema = any>(definition: {
       });
       return 1;
     } catch (err) {
-      console.error(`Failed to update item with id ${id}`);
+      console.error(`Failed to update item with id ${id}:`, err);
+      throw err;
+    }
+  };
+
+  /**
+   * Updates ALL records matching the criteria with the SAME partial update object.
+   * @param where The filtering criteria (WhereClause<StoreSchema>).
+   * @param partialUpdate The partial StoreSchema object to apply to ALL matching records.
+   * @returns A Promise that resolves to the number of records updated.
+   */
+  const updateAllWhere = async (
+    where: WhereClause<StoreSchema>,
+    partialUpdate: Partial<StoreSchema>
+  ): Promise<number> => {
+    try {
+      const collectionToUpdate = collection.toCollection().filter((item) => {
+        return evaluateCondition(item.object, where);
+      });
+
+      const modifier = (item: StoreRecord<StoreSchema>) => {
+        // @ts-ignore: We know 'object' exists and we are merging partialUpdate into it
+        item.object = { ...item.object, ...partialUpdate };
+      };
+
+      const recordsUpdated = await collectionToUpdate.modify(modifier);
+
+      return recordsUpdated;
+    } catch (err) {
+      console.error(`Failed to bulk update all where in ${name}:`, err);
+      throw err;
+    }
+  };
+
+  /**
+   * Performs a high-performance bulk update on multiple records using their internal primary keys (IDs).
+   * Changes are merged into the existing object payload.
+   * @param updates An array of objects, each containing the internal 'id' and the 'changes' (Partial<StoreSchema>) to apply.
+   * @returns A Promise that resolves to the number of records successfully updated.
+   */
+  const updateManyByInternalId = async (
+    updates: InternalUpdatePayload<StoreSchema>
+  ): Promise<number> => {
+    try {
+      const ids = updates.map((u) => u.id);
+
+      const existingRecords = await collection.bulkGet(ids);
+
+      const recordsToPut: StoreRecord<StoreSchema>[] = [];
+
+      existingRecords.forEach((record, index) => {
+        const update = updates[index];
+
+        if (record && update) {
+          recordsToPut.push({
+            id: record.id,
+            object: {
+              ...record.object,
+              ...update.changes,
+            } as StoreSchema,
+          });
+        }
+      });
+
+      await collection.bulkPut(recordsToPut);
+
+      return recordsToPut.length;
+    } catch (err) {
+      console.error(`Failed to bulk update by internal ID in ${name}:`, err);
+      throw err;
+    }
+  };
+
+  /**
+   * Synchronizes multiple records by looking them up using an arbitrary external key
+   * and applying individual partial updates in a single bulk transaction.
+   * @param updates An array defining the match criteria (using 'key' and 'value') and the changes to apply.
+   * @returns A Promise that resolves to the number of records successfully updated.
+   */
+  const updateManyByExternalKey = async (
+    updates: ExternalUpdatePayload<StoreSchema>
+  ): Promise<number> => {
+    try {
+      const bulkUpdatesForIDB: InternalUpdatePayload<StoreSchema> = [];
+
+      for (const update of updates) {
+        const whereClause = {
+          [update.key]: update.value,
+        } as WhereClause<StoreSchema>;
+
+        const localRecord = await findFirst(whereClause);
+
+        if (localRecord) {
+          bulkUpdatesForIDB.push({
+            id: localRecord.id,
+            changes: update.changes,
+          });
+        }
+      }
+
+      if (bulkUpdatesForIDB.length > 0) {
+        return await updateManyByInternalId(bulkUpdatesForIDB);
+      }
+
+      return 0;
+    } catch (err) {
+      console.error(`Failed to update by external key in ${name}:`, err);
       throw err;
     }
   };
@@ -377,11 +501,15 @@ export function createIDBStore<StoreSchema = any>(definition: {
   };
 
   return {
+    collection,
     addItem,
     findMany,
     findFirst,
     findLast,
     updateItem,
+    updateAllWhere,
+    updateManyByInternalId,
+    updateManyByExternalKey,
     deleteItem,
     deleteMany,
     addMany,
