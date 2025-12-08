@@ -1,8 +1,17 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { liveQuery, Dexie, Table, Collection } from "dexie";
 
+type ComparisonOperators<Value = any> = {
+  $gt?: Value;
+  $gte?: Value;
+  $lt?: Value;
+  $lte?: Value;
+  $in?: Value[];
+  $contains?: any;
+};
+
 type EqualityCondition<T> = {
-  [P in keyof T]?: T[P] | DeepPartial<T[P]>;
+  [P in keyof T]?: T[P] | DeepPartial<T[P]> | ComparisonOperators<T[P]>;
 };
 
 type LogicalCondition<T> = {
@@ -10,7 +19,10 @@ type LogicalCondition<T> = {
   $or?: (WhereClause<T> | EqualityCondition<T>)[];
 };
 
-export type WhereClause<T> = DeepPartial<T> | LogicalCondition<T>;
+export type WhereClause<T> =
+  | DeepPartial<T>
+  | LogicalCondition<T>
+  | EqualityCondition<T>;
 
 type DeepPartial<T> = T extends object
   ? {
@@ -29,6 +41,7 @@ export type StoreRecord<StoreSchema> = {
 /**
  * The payload type for the bulk update by internal ID method.
  */
+
 type InternalUpdatePayload<StoreSchema> = Array<{
   id: number;
   changes: Partial<StoreSchema>;
@@ -36,7 +49,6 @@ type InternalUpdatePayload<StoreSchema> = Array<{
 
 /**
  * The payload type for the bulk update by external key method.
- * Uses the simplified 'key' and 'value' fields.
  */
 type ExternalUpdatePayload<StoreSchema> = Array<{
   key: keyof StoreSchema;
@@ -45,12 +57,30 @@ type ExternalUpdatePayload<StoreSchema> = Array<{
 }>;
 
 /**
+ * Optional configuration for the store: indexes allow more efficient queries.
+ * This is backward compatible: you can omit `indexes`.
+ * Example: { user: '++id, userId, status, "object.name"' }
+ */
+export type CreateStoreDefinition = {
+  name: string;
+  version?: number;
+  /**
+   * Optional indexes declaration compatible with Dexie `stores` string format.
+   * If omitted, the store remains `++id, object` (backward compatible).
+   * Example: { indexSpec: '++id, object.userId, object.status' }
+   */
+  indexSpec?: string;
+};
+
+// Utilities
+const isObject = (v: any) =>
+  v !== null && typeof v === "object" && !Array.isArray(v);
+
+/**
  * Recursively sorts object keys for deterministic JSON string comparison.
- * @param obj The object to sort.
- * @returns An object with sorted keys.
  */
 const sortObjectKeys = (obj: any): any => {
-  if (typeof obj !== "object" || obj === null) return obj;
+  if (!isObject(obj) && !Array.isArray(obj)) return obj;
   if (Array.isArray(obj)) return obj.map(sortObjectKeys);
 
   const sortedKeys = Object.keys(obj).sort();
@@ -62,11 +92,33 @@ const sortObjectKeys = (obj: any): any => {
 };
 
 /**
- * Performs a robust deep comparison of two objects by standardizing and stringifying their JSON structure.
- * This is used to prevent unnecessary React re-renders.
- * @param a The first object.
- * @param b The second object.
- * @returns True if the contents are identical, regardless of key order.
+ * Lightweight non-cryptographic 32-bit hash (djb2 variant) over a string.
+ * Faster than JSON.stringify + crypto in many environments and deterministic for our use.
+ */
+const djb2Hash32 = (str: string) => {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = (h * 33) ^ str.charCodeAt(i);
+  }
+  // >>> 0 to convert to unsigned 32-bit
+  return (h >>> 0).toString(36);
+};
+
+/**
+ * Generates a deterministic content key (small string) for an object.
+ */
+const contentKeyFor = (obj: any) => {
+  try {
+    const sorted = sortObjectKeys(obj);
+    const s = JSON.stringify(sorted);
+    return djb2Hash32(s);
+  } catch {
+    return String(Math.random());
+  }
+};
+
+/**
+ * Deep JSON structural compare using sorted keys as fallback.
  */
 export function robustJsonCompare(a: any, b: any): boolean {
   if (a === b) return true;
@@ -79,92 +131,167 @@ export function robustJsonCompare(a: any, b: any): boolean {
   }
 }
 
-/**
- * Evaluates a WhereClause condition against a single record payload.
- * Supports nested equality, $and, and $or logic.
- */
-function evaluateCondition<StoreSchema>(
-  itemPayload: StoreSchema,
-  condition: WhereClause<StoreSchema> | EqualityCondition<StoreSchema>
+// Matcher: recursive and supports operators
+
+function primitiveEqual(a: any, b: any) {
+  return a === b;
+}
+
+function matchComparisonOperators(
+  value: any,
+  operators: ComparisonOperators<any>
 ): boolean {
-  if (!condition || typeof condition !== "object") return false;
-
-  const keys = Object.keys(condition);
-
-  if (keys.includes("$or")) {
-    const orConditions = (condition as LogicalCondition<StoreSchema>).$or || [];
-
-    return orConditions.some((c) => evaluateCondition(itemPayload, c));
-  }
-
-  if (keys.includes("$and")) {
-    const andConditions =
-      (condition as LogicalCondition<StoreSchema>).$and || [];
-
-    return andConditions.every((c) => evaluateCondition(itemPayload, c));
-  }
-
-  for (const topLevelKey of keys as (keyof StoreSchema)[]) {
-    const filterValue = (condition as any)[topLevelKey];
-    const itemValue = itemPayload[topLevelKey];
-
-    if (
-      typeof filterValue === "object" &&
-      filterValue !== null &&
-      !Array.isArray(filterValue)
-    ) {
-      const nestedKeys = Object.keys(filterValue);
-
-      if (typeof itemValue !== "object" || itemValue === null) return false;
-
-      for (const nestedKey of nestedKeys) {
-        if ((itemValue as any)[nestedKey] !== filterValue[nestedKey]) {
+  if (!isObject(operators)) return false;
+  for (const op of Object.keys(
+    operators
+  ) as (keyof ComparisonOperators<any>)[]) {
+    const v = (operators as any)[op];
+    switch (op) {
+      case "$gt":
+        if (!(value > v)) return false;
+        break;
+      case "$gte":
+        if (!(value >= v)) return false;
+        break;
+      case "$lt":
+        if (!(value < v)) return false;
+        break;
+      case "$lte":
+        if (!(value <= v)) return false;
+        break;
+      case "$in":
+        if (
+          !Array.isArray(v) ||
+          !v.some((x: any) => robustJsonCompare(x, value))
+        )
+          return false;
+        break;
+      case "$contains":
+        if (Array.isArray(value)) {
+          if (!value.some((x) => robustJsonCompare(x, v))) return false;
+        } else if (typeof value === "string") {
+          if (typeof v !== "string" || !value.includes(v)) return false;
+        } else {
           return false;
         }
-      }
-    } else if (itemValue !== filterValue) {
-      return false;
+        break;
+      default:
+        return false;
     }
   }
-
   return true;
 }
 
 /**
- * Creates an isolated, type-safe data store based on Dexie (IndexedDB).
+ * Evaluates a WhereClause condition against a single record payload.
+ * Supports nested equality, $and, $or, and comparison operators.
  */
-export function createIDBStore<StoreSchema = any>(definition: {
-  name: string;
-  version?: number;
-}) {
-  const { name, version = 1 } = definition;
+function evaluateCondition<StoreSchema>(
+  itemPayload: any,
+  condition: WhereClause<StoreSchema> | EqualityCondition<StoreSchema>
+): boolean {
+  if (condition === null || condition === undefined) return false;
+
+  // Logical operators at top
+  // @ts-expect-error
+  if (isObject(condition) && ("$or" in condition || "$and" in condition)) {
+    const condAny = condition as any;
+    if ("$or" in condAny) {
+      if (!Array.isArray(condAny.$or)) return false;
+      return condAny.$or.some((c: any) => evaluateCondition(itemPayload, c));
+    }
+    if ("$and" in condAny) {
+      if (!Array.isArray(condAny.$and)) return false;
+      return condAny.$and.every((c: any) => evaluateCondition(itemPayload, c));
+    }
+  }
+
+  // condition is an object mapping keys to expected values/operators
+  if (!isObject(condition)) {
+    // Should not happen normally - compare strictly
+    return primitiveEqual(itemPayload, condition);
+  }
+
+  if (!isObject(itemPayload)) return false;
+
+  for (const key of Object.keys(condition)) {
+    const filterValue = (condition as any)[key];
+    const itemValue = itemPayload[key];
+
+    // If filterValue is operator object (e.g. { $gt: 5 })
+    if (
+      isObject(filterValue) &&
+      Object.keys(filterValue).some((k) => k.startsWith("$"))
+    ) {
+      if (
+        !matchComparisonOperators(
+          itemValue,
+          filterValue as ComparisonOperators<any>
+        )
+      )
+        return false;
+      continue;
+    }
+
+    // If both are arrays: require same length and deep-equal per index
+    if (Array.isArray(filterValue)) {
+      if (!Array.isArray(itemValue)) return false;
+      if (filterValue.length !== itemValue.length) return false;
+      for (let i = 0; i < filterValue.length; i++) {
+        if (!robustJsonCompare(filterValue[i], itemValue[i])) return false;
+      }
+      continue;
+    }
+
+    // If filterValue is an object: recurse
+    if (isObject(filterValue)) {
+      if (!isObject(itemValue)) return false;
+      if (!evaluateCondition(itemValue, filterValue)) return false;
+      continue;
+    }
+
+    // Primitive comparison
+    if (!primitiveEqual(itemValue, filterValue)) return false;
+  }
+  return true;
+}
+
+// Main factory
+
+export function createIDBStore<StoreSchema = any>(
+  definition: CreateStoreDefinition
+) {
+  const { name, version = 1, indexSpec } = definition;
 
   const idb = new Dexie(name);
 
-  idb.version(version).stores({
-    [name]: "++id, object",
-  });
+  // Build stores definition string preserving backward compatibility
+  // If indexSpec is provided, use it; otherwise default to '++id, object'
+  const storeDef =
+    indexSpec && indexSpec.length > 0 ? indexSpec : "++id, object";
+
+  // note: stores expects an object map: { storeName: "++id, ..." }
+  idb.version(version).stores({ [name]: storeDef });
 
   const collection: Table<StoreRecord<StoreSchema>, number> = (idb as any)[
     name
   ];
 
-  /**
-   * Finds the first record (lowest ID) matching the WhereClause criteria.
-   * Uses the forward cursor and stops immediately on the first match.
-   * @param where The filtering criteria (WhereClause<StoreSchema>).
-   * @returns A Promise that resolves to the first matching StoreRecord, or undefined.
-   */
+  const normalizeWhere = (where?: WhereClause<StoreSchema>) => {
+    if (!where) return "";
+    try {
+      return JSON.stringify(sortObjectKeys(where as any));
+    } catch {
+      return String(where as any);
+    }
+  };
+
   const findFirst = async (where: WhereClause<StoreSchema>) => {
     try {
-      // Start forward cursor scan (lowest ID first)
       const matchingRecord = await collection
         .toCollection()
-        .filter((item) => {
-          return evaluateCondition(item.object, where);
-        })
+        .filter((item) => evaluateCondition(item.object, where))
         .first();
-
       return matchingRecord;
     } catch (err) {
       console.error(`Failed to find first in ${name}:`, err);
@@ -172,23 +299,13 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Finds the last record (highest ID) matching the WhereClause criteria.
-   * This is optimized by using a reverse cursor scan on the primary key, stopping immediately on the first match.
-   * @param where The filtering criteria (WhereClause<StoreSchema>).
-   * @returns A Promise that resolves to the last matching StoreRecord, or undefined.
-   */
   const findLast = async (where: WhereClause<StoreSchema>) => {
     try {
-      // Start reverse cursor scan (highest ID first)
       const matchingRecord = await collection
         .toCollection()
         .reverse()
-        .filter((item) => {
-          return evaluateCondition(item.object, where);
-        })
+        .filter((item) => evaluateCondition(item.object, where))
         .first();
-
       return matchingRecord;
     } catch (err) {
       console.error(`Failed to find last in ${name}:`, err);
@@ -196,22 +313,12 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Finds all records matching the WhereClause criteria.
-   * Iterates the full collection and returns all matching records.
-   * @param where The filtering criteria (WhereClause<StoreSchema>).
-   * @returns A Promise that resolves to an array of matching StoreRecords.
-   */
   const findMany = async (where: WhereClause<StoreSchema>) => {
     try {
-      // Get all records and apply the client-side filter.
       const matchingRecords = await collection
         .toCollection()
-        .filter((item) => {
-          return evaluateCondition(item.object, where);
-        })
+        .filter((item) => evaluateCondition(item.object, where))
         .toArray();
-
       return matchingRecords;
     } catch (err) {
       console.error(`Failed to find many in ${name}:`, err);
@@ -219,38 +326,28 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Adds a single item to the store.
-   * @param item The StoreSchema object to add.
-   * @returns A Promise that resolves to the primary key (ID) of the new item.
-   */
   const addItem = async (item: StoreSchema) => {
-    // @ts-expect-error
-    const data: StoreRecord<StoreSchema> = { object: item };
+    const data: StoreRecord<StoreSchema> = {
+      object: item,
+    } as StoreRecord<StoreSchema>;
     try {
-      return await collection.add(data as any);
+      const key = await collection.add(data as any);
+      return key as number;
     } catch (err) {
       console.error(`Failed to add item to ${name}:`, err);
       throw err;
     }
   };
 
-  /**
-   * Adds multiple items to the store in a single transaction.
-   * @param items An array of StoreSchema objects to add.
-   * @returns A Promise that resolves to the primary key (ID) of the last added item.
-   */
   const addMany = async (items: StoreSchema[]) => {
     try {
       // @ts-expect-error
       const itemsForInsertion: StoreRecord<StoreSchema>[] = items.map(
-        (item) => ({
-          object: item,
-        })
+        (item) => ({ object: item })
       );
-
-      const lastKey = await collection.bulkAdd(itemsForInsertion);
-
+      const lastKey = (await collection.bulkAdd(
+        itemsForInsertion as any[]
+      )) as unknown as number;
       return lastKey;
     } catch (err) {
       console.error(`Failed to bulk add items to ${name}:`, err);
@@ -258,11 +355,6 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Deletes a single item using its primary key (ID).
-   * @param id The primary key (ID) of the item to delete.
-   * @returns A Promise that resolves when the deletion is complete (void).
-   */
   const deleteItem = async (id: number) => {
     try {
       await collection.delete(id);
@@ -272,14 +364,11 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Deletes multiple items using their primary keys (IDs) in a single transaction.
-   * @param ids An array of primary keys (IDs) to delete.
-   * @returns A Promise that resolves when the bulk deletion is complete (void).
-   */
   const deleteMany = async (ids: number[]) => {
     try {
-      await collection.bulkDelete(ids);
+      await idb.transaction("rw", collection, async () => {
+        await collection.bulkDelete(ids);
+      });
     } catch (err) {
       console.error(
         `Failed to bulk delete items with ids ${ids.join(",")}:`,
@@ -289,12 +378,6 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Updates a record by its primary key (ID) using a partial update or a state function.
-   * @param id The primary key (ID) of the item to update.
-   * @param update The partial StoreSchema object or a function that receives the previous value.
-   * @returns A Promise that resolves to 1 (success) or throws on failure.
-   */
   const updateItem = async (
     id: number,
     update:
@@ -302,18 +385,17 @@ export function createIDBStore<StoreSchema = any>(definition: {
       | ((previousValue: StoreSchema) => Partial<StoreSchema>)
   ) => {
     try {
-      const previousValue = await collection.get(id);
-
+      const previousRecord = await collection.get(id);
+      if (!previousRecord) throw new Error(`Record with id ${id} not found`);
+      const previousValue = previousRecord.object;
       const updatedObject =
-        typeof update === "function" ? update(previousValue?.object!) : update;
-
+        typeof update === "function" ? update(previousValue) : update;
       await collection.update(id, {
-        // @ts-expect-error
         object: {
-          ...previousValue?.object,
-          ...updatedObject,
+          ...previousValue,
+          ...(updatedObject as Partial<StoreSchema>),
         },
-      });
+      } as any);
       return 1;
     } catch (err) {
       console.error(`Failed to update item with id ${id}:`, err);
@@ -321,67 +403,57 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Updates ALL records matching the criteria with the SAME partial update object.
-   * @param where The filtering criteria (WhereClause<StoreSchema>).
-   * @param partialUpdate The partial StoreSchema object to apply to ALL matching records.
-   * @returns A Promise that resolves to the number of records updated.
-   */
   const updateAllWhere = async (
     where: WhereClause<StoreSchema>,
     partialUpdate: Partial<StoreSchema>
   ): Promise<number> => {
     try {
-      const collectionToUpdate = collection.toCollection().filter((item) => {
-        return evaluateCondition(item.object, where);
+      let updatedCount = 0;
+      await idb.transaction("rw", collection, async () => {
+        const collectionToUpdate = collection
+          .toCollection()
+          .filter((item) => evaluateCondition(item.object, where));
+        const modifier = (item: StoreRecord<StoreSchema>) => {
+          // merge partial update in-place
+          item.object = {
+            ...(item.object as any),
+            ...(partialUpdate as any),
+          } as StoreSchema;
+        };
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore - Dexie typing for Collection.modify isn't easily expressible here
+        updatedCount = await collectionToUpdate.modify(modifier);
       });
-
-      const modifier = (item: StoreRecord<StoreSchema>) => {
-        // @ts-ignore: We know 'object' exists and we are merging partialUpdate into it
-        item.object = { ...item.object, ...partialUpdate };
-      };
-
-      const recordsUpdated = await collectionToUpdate.modify(modifier);
-
-      return recordsUpdated;
+      return updatedCount;
     } catch (err) {
       console.error(`Failed to bulk update all where in ${name}:`, err);
       throw err;
     }
   };
 
-  /**
-   * Performs a high-performance bulk update on multiple records using their internal primary keys (IDs).
-   * Changes are merged into the existing object payload.
-   * @param updates An array of objects, each containing the internal 'id' and the 'changes' (Partial<StoreSchema>) to apply.
-   * @returns A Promise that resolves to the number of records successfully updated.
-   */
   const updateManyByInternalId = async (
     updates: InternalUpdatePayload<StoreSchema>
   ): Promise<number> => {
     try {
       const ids = updates.map((u) => u.id);
-
       const existingRecords = await collection.bulkGet(ids);
-
       const recordsToPut: StoreRecord<StoreSchema>[] = [];
-
       existingRecords.forEach((record, index) => {
         const update = updates[index];
-
         if (record && update) {
           recordsToPut.push({
             id: record.id,
             object: {
-              ...record.object,
-              ...update.changes,
+              ...(record.object as any),
+              ...(update.changes as any),
             } as StoreSchema,
           });
         }
       });
-
-      await collection.bulkPut(recordsToPut);
-
+      if (recordsToPut.length === 0) return 0;
+      await idb.transaction("rw", collection, async () => {
+        await collection.bulkPut(recordsToPut as any[]);
+      });
       return recordsToPut.length;
     } catch (err) {
       console.error(`Failed to bulk update by internal ID in ${name}:`, err);
@@ -389,50 +461,40 @@ export function createIDBStore<StoreSchema = any>(definition: {
     }
   };
 
-  /**
-   * Synchronizes multiple records by looking them up using an arbitrary external key
-   * and applying individual partial updates in a single bulk transaction.
-   * @param updates An array defining the match criteria (using 'key' and 'value') and the changes to apply.
-   * @returns A Promise that resolves to the number of records successfully updated.
-   */
   const updateManyByExternalKey = async (
     updates: ExternalUpdatePayload<StoreSchema>
   ): Promise<number> => {
     try {
-      const bulkUpdatesForIDB: InternalUpdatePayload<StoreSchema> = [];
-
+      if (!updates || updates.length === 0) return 0;
+      // Fetch all records once and do in-memory matching to avoid N+1
+      const allRecords = await collection.toArray();
+      const idToUpdatedObject = new Map<number, StoreSchema>();
       for (const update of updates) {
-        const whereClause = {
-          [update.key]: update.value,
-        } as WhereClause<StoreSchema>;
-
-        const localRecord = await findFirst(whereClause);
-
-        if (localRecord) {
-          bulkUpdatesForIDB.push({
-            id: localRecord.id,
-            changes: update.changes,
-          });
+        const candidates = allRecords.filter((rec) =>
+          robustJsonCompare((rec.object as any)[update.key], update.value)
+        );
+        for (const rec of candidates) {
+          const merged = {
+            ...(rec.object as any),
+            ...(update.changes as any),
+          } as StoreSchema;
+          idToUpdatedObject.set(rec.id, merged);
         }
       }
-
-      if (bulkUpdatesForIDB.length > 0) {
-        return await updateManyByInternalId(bulkUpdatesForIDB);
-      }
-
-      return 0;
+      if (idToUpdatedObject.size === 0) return 0;
+      const toPut: StoreRecord<StoreSchema>[] = Array.from(
+        idToUpdatedObject.entries()
+      ).map(([id, object]) => ({ id, object }));
+      await idb.transaction("rw", collection, async () => {
+        await collection.bulkPut(toPut as any[]);
+      });
+      return toPut.length;
     } catch (err) {
       console.error(`Failed to update by external key in ${name}:`, err);
       throw err;
     }
   };
 
-  /**
-   * A React hook that subscribes to live record changes based on filter criteria.
-   * @param where Optional filtering criteria using WhereClause<StoreSchema> ($and, $or supported).
-   * @param onError Optional error handler for liveQuery subscription failures.
-   * @returns An array of matching StoreRecords ({ id, object }).
-   */
   const useRecords = ({
     where,
     onError,
@@ -442,47 +504,55 @@ export function createIDBStore<StoreSchema = any>(definition: {
   } = {}) => {
     const [objects, setObjects] = useState<StoreRecord<StoreSchema>[]>([]);
 
+    // memoized normalized where string (deterministic)
+    const normalizedWhere = useMemo(() => normalizeWhere(where), [where]);
+
     useEffect(() => {
       const observable = liveQuery(async () => {
         let query: Collection<
           StoreRecord<StoreSchema>,
           number
         > = collection.toCollection();
-
-        if (where && Object.keys(where).length > 0) {
-          query = query.filter((item) => {
-            return evaluateCondition(item.object, where);
-          });
+        if (where && Object.keys(where as any).length > 0) {
+          query = query.filter((item) => evaluateCondition(item.object, where));
         }
-
         const results = await query.toArray();
-        return results;
+
+        // Prepare compact content keys using djb2Hash32 over sorted JSON
+        const withContentKey: Array<
+          StoreRecord<StoreSchema> & { _contentKey: string }
+        > = results.map((r) => {
+          const key = contentKeyFor(r.object);
+          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+          // @ts-ignore - we attach an internal ephemeral key used only inside the hook
+          return { ...r, _contentKey: key };
+        });
+        return withContentKey as any;
       });
 
       const subscription = observable.subscribe({
-        next: (newResults: StoreRecord<StoreSchema>[]) => {
+        next: (
+          newResults: Array<StoreRecord<StoreSchema> & { _contentKey: string }>
+        ) => {
           setObjects((previousResults) => {
-            if (previousResults.length !== newResults.length) return newResults;
-            if (previousResults.length === 0) return previousResults;
+            if (previousResults.length !== newResults.length)
+              return newResults.map(({ _contentKey, ...rest }) => rest);
+            if (previousResults.length === 0) return [];
 
-            const previousObjectDict = Object.fromEntries(
-              previousResults.map((o) => [o.id, o.object])
+            const prevMap: Record<number, string> = Object.fromEntries(
+              previousResults.map((r) => [r.id, contentKeyFor(r.object)])
             );
 
-            let contentChanged = false;
-
-            for (const newRecord of newResults) {
-              const oldObject = previousObjectDict[newRecord.id];
-              if (!oldObject) {
-                contentChanged = true;
-                break;
+            for (const newRec of newResults) {
+              const prevKey = prevMap[newRec.id];
+              if (prevKey === undefined) {
+                return newResults.map(({ _contentKey, ...rest }) => rest);
               }
-              if (!robustJsonCompare(newRecord.object, oldObject)) {
-                contentChanged = true;
-                break;
+              if (prevKey !== newRec._contentKey) {
+                return newResults.map(({ _contentKey, ...rest }) => rest);
               }
             }
-            return contentChanged ? newResults : previousResults;
+            return previousResults;
           });
         },
         error: (err: any) => {
@@ -492,10 +562,8 @@ export function createIDBStore<StoreSchema = any>(definition: {
         },
       });
 
-      return () => {
-        subscription.unsubscribe();
-      };
-    }, [name, JSON.stringify(where)]);
+      return () => subscription.unsubscribe();
+    }, [name, normalizedWhere]);
 
     return objects;
   };
