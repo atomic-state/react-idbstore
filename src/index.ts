@@ -378,6 +378,31 @@ export function createIDBStore<StoreSchema = any>(
     }
   };
 
+  const deleteManyWhere = async (
+    where: WhereClause<StoreSchema>
+  ): Promise<number> => {
+    try {
+      let deletedCount = 0;
+
+      await idb.transaction("rw", collection, async () => {
+        const toDelete = await collection
+          .toCollection()
+          .filter((item) => evaluateCondition(item.object, where))
+          .primaryKeys();
+
+        if (toDelete.length === 0) return;
+
+        await collection.bulkDelete(toDelete as number[]);
+        deletedCount = toDelete.length;
+      });
+
+      return deletedCount;
+    } catch (err) {
+      console.error(`Failed to bulk delete many where in ${name}:`, err);
+      throw err;
+    }
+  };
+
   const updateItem = async (
     id: number,
     update:
@@ -580,6 +605,7 @@ export function createIDBStore<StoreSchema = any>(
     updateManyByExternalKey,
     deleteItem,
     deleteMany,
+    deleteManyWhere,
     addMany,
     useRecords,
   };
