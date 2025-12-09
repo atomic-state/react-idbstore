@@ -30,6 +30,20 @@ type DeepPartial<T> = T extends object
     }
   : T;
 
+export type SelectClause<T> = {
+  [P in keyof T]?: T[P] extends object ? SelectClause<T[P]> | true : true;
+};
+
+type ApplySelect<T, S> = S extends SelectClause<T>
+  ? {
+      [P in keyof S & keyof T]: S[P] extends true
+        ? T[P]
+        : S[P] extends object
+        ? ApplySelect<T[P], S[P]>
+        : never;
+    }
+  : T;
+
 /**
  * The structure of a record as stored in IndexedDB (includes the auto-incremented id).
  */
@@ -38,37 +52,20 @@ export type StoreRecord<StoreSchema> = {
   object: StoreSchema;
 };
 
-/**
- * The payload type for the bulk update by internal ID method.
- */
-
 type InternalUpdatePayload<StoreSchema> = Array<{
   id: number;
   changes: Partial<StoreSchema>;
 }>;
 
-/**
- * The payload type for the bulk update by external key method.
- */
 type ExternalUpdatePayload<StoreSchema> = Array<{
   key: keyof StoreSchema;
   value: any;
   changes: Partial<StoreSchema>;
 }>;
 
-/**
- * Optional configuration for the store: indexes allow more efficient queries.
- * This is backward compatible: you can omit `indexes`.
- * Example: { user: '++id, userId, status, "object.name"' }
- */
 export type CreateStoreDefinition = {
   name: string;
   version?: number;
-  /**
-   * Optional indexes declaration compatible with Dexie `stores` string format.
-   * If omitted, the store remains `++id, object` (backward compatible).
-   * Example: { indexSpec: '++id, object.userId, object.status' }
-   */
   indexSpec?: string;
 };
 
@@ -76,9 +73,6 @@ export type CreateStoreDefinition = {
 const isObject = (v: any) =>
   v !== null && typeof v === "object" && !Array.isArray(v);
 
-/**
- * Recursively sorts object keys for deterministic JSON string comparison.
- */
 const sortObjectKeys = (obj: any): any => {
   if (!isObject(obj) && !Array.isArray(obj)) return obj;
   if (Array.isArray(obj)) return obj.map(sortObjectKeys);
@@ -91,22 +85,14 @@ const sortObjectKeys = (obj: any): any => {
   return sortedObject;
 };
 
-/**
- * Lightweight non-cryptographic 32-bit hash (djb2 variant) over a string.
- * Faster than JSON.stringify + crypto in many environments and deterministic for our use.
- */
 const djb2Hash32 = (str: string) => {
   let h = 5381;
   for (let i = 0; i < str.length; i++) {
     h = (h * 33) ^ str.charCodeAt(i);
   }
-  // >>> 0 to convert to unsigned 32-bit
   return (h >>> 0).toString(36);
 };
 
-/**
- * Generates a deterministic content key (small string) for an object.
- */
 const contentKeyFor = (obj: any) => {
   try {
     const sorted = sortObjectKeys(obj);
@@ -117,9 +103,6 @@ const contentKeyFor = (obj: any) => {
   }
 };
 
-/**
- * Deep JSON structural compare using sorted keys as fallback.
- */
 export function robustJsonCompare(a: any, b: any): boolean {
   if (a === b) return true;
   try {
@@ -180,6 +163,24 @@ function matchComparisonOperators(
     }
   }
   return true;
+}
+
+function applySelect<T>(obj: T, select?: SelectClause<T>): any {
+  if (!select) return obj;
+  if (!isObject(obj)) return obj;
+
+  const result: any = {};
+  for (const key of Object.keys(select)) {
+    const selector = (select as any)[key];
+    const value = (obj as any)[key];
+
+    if (selector === true) {
+      result[key] = value;
+    } else if (isObject(selector) && isObject(value)) {
+      result[key] = applySelect(value, selector);
+    }
+  }
+  return result;
 }
 
 /**
@@ -286,44 +287,108 @@ export function createIDBStore<StoreSchema = any>(
     }
   };
 
-  const findFirst = async (where: WhereClause<StoreSchema>) => {
+  type CacheEntry = {
+    contentKey: string;
+    result: any;
+    lastUsed: number;
+  };
+
+  const CACHE_MAX = 500; // soft cap, tune as needed
+  const queryResultCache = new Map<string, CacheEntry>();
+
+  const makeQueryKey = (
+    where?: WhereClause<StoreSchema>,
+    select?: SelectClause<StoreSchema>
+  ) => {
     try {
-      const matchingRecord = await collection
-        .toCollection()
-        .filter((item) => evaluateCondition(item.object, where))
-        .first();
-      return matchingRecord;
-    } catch (err) {
-      console.error(`Failed to find first in ${name}:`, err);
-      throw err;
+      const w = where === undefined ? null : sortObjectKeys(where as any);
+      const s = select === undefined ? null : sortObjectKeys(select as any);
+      return JSON.stringify({ w, s, name });
+    } catch {
+      // fallback - not ideal but safe
+      return String(Math.random());
     }
   };
 
-  const findLast = async (where: WhereClause<StoreSchema>) => {
-    try {
-      const matchingRecord = await collection
-        .toCollection()
-        .reverse()
-        .filter((item) => evaluateCondition(item.object, where))
-        .first();
-      return matchingRecord;
-    } catch (err) {
-      console.error(`Failed to find last in ${name}:`, err);
-      throw err;
-    }
+  const ensureCacheLimit = () => {
+    if (queryResultCache.size <= CACHE_MAX) return;
+    // evict least recently used (smallest lastUsed)
+    const entries = Array.from(queryResultCache.entries());
+    entries.sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+    const toRemove = entries.slice(0, entries.length - CACHE_MAX);
+    for (const [k] of toRemove) queryResultCache.delete(k);
   };
 
-  const findMany = async (where: WhereClause<StoreSchema>) => {
-    try {
-      const matchingRecords = await collection
-        .toCollection()
-        .filter((item) => evaluateCondition(item.object, where))
-        .toArray();
-      return matchingRecords;
-    } catch (err) {
-      console.error(`Failed to find many in ${name}:`, err);
-      throw err;
-    }
+  const findFirst = async <
+    S extends SelectClause<StoreSchema> | undefined
+  >(params: {
+    where: WhereClause<StoreSchema>;
+    select?: S;
+  }) => {
+    const { where, select } = params;
+
+    const record = await collection
+      .toCollection()
+      .filter((item) => evaluateCondition(item.object, where))
+      .first();
+
+    if (!record) return undefined;
+
+    return {
+      ...record,
+      object: applySelect(record.object, select),
+    } as StoreRecord<
+      S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+    >;
+  };
+
+  const findLast = async <
+    S extends SelectClause<StoreSchema> | undefined
+  >(params: {
+    where: WhereClause<StoreSchema>;
+    select?: S;
+  }) => {
+    const { where, select } = params;
+
+    const record = await collection
+      .toCollection()
+      .reverse()
+      .filter((item) => evaluateCondition(item.object, where))
+      .first();
+
+    if (!record) return undefined;
+
+    return {
+      ...record,
+      object: applySelect(record.object, select),
+    } as StoreRecord<
+      S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+    >;
+  };
+
+  const findMany = async <
+    S extends SelectClause<StoreSchema> | undefined
+  >(params: {
+    where: WhereClause<StoreSchema>;
+    select?: S;
+  }): Promise<
+    Array<
+      StoreRecord<
+        S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+      >
+    >
+  > => {
+    const { where, select } = params;
+
+    const records = await collection
+      .toCollection()
+      .filter((item) => evaluateCondition(item.object, where))
+      .toArray();
+
+    return records.map((r) => ({
+      ...r,
+      object: applySelect(r.object, select),
+    })) as any;
   };
 
   const addItem = async (item: StoreSchema) => {
@@ -520,20 +585,30 @@ export function createIDBStore<StoreSchema = any>(
     }
   };
 
-  const useRecords = ({
+  const useRecords = <S extends SelectClause<StoreSchema> | undefined>({
     where,
+    select,
     onError,
   }: {
     where?: WhereClause<StoreSchema>;
+    select?: S;
     onError?: (error: Error) => void;
   } = {}) => {
-    const [objects, setObjects] = useState<StoreRecord<StoreSchema>[]>([]);
+    const [objects, setObjects] = useState<
+      Array<
+        StoreRecord<
+          S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+        >
+      >
+    >([]);
 
     // memoized normalized where string (deterministic)
     const normalizedWhere = useMemo(() => normalizeWhere(where), [where]);
 
     useEffect(() => {
       const observable = liveQuery(async () => {
+        const queryKey = makeQueryKey(where, select);
+
         let query: Collection<
           StoreRecord<StoreSchema>,
           number
@@ -544,20 +619,49 @@ export function createIDBStore<StoreSchema = any>(
         const results = await query.toArray();
 
         // Prepare compact content keys using djb2Hash32 over sorted JSON
-        const withContentKey: Array<
-          StoreRecord<StoreSchema> & { _contentKey: string }
-        > = results.map((r) => {
-          const key = contentKeyFor(r.object);
-          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-          // @ts-ignore - we attach an internal ephemeral key used only inside the hook
-          return { ...r, _contentKey: key };
+        const withContentKey = results.map((r) => {
+          const selectedObject = applySelect(r.object, select);
+          const key = contentKeyFor(selectedObject);
+
+          return {
+            ...r,
+            object: selectedObject,
+            _contentKey: key,
+          };
         });
+
+        // Compute combined content key for whole result set
+        const combined = djb2Hash32(
+          withContentKey.map((r) => r._contentKey).join("|")
+        );
+
+        // Check cache
+        const cached = queryResultCache.get(queryKey);
+        if (cached && cached.contentKey === combined) {
+          // update lastUsed and return same reference
+          cached.lastUsed = Date.now();
+          return cached.result;
+        }
+
+        // Not cached or stale → set cache
+        const entry: CacheEntry = {
+          contentKey: combined,
+          result: withContentKey,
+          lastUsed: Date.now(),
+        };
+        queryResultCache.set(queryKey, entry);
+        ensureCacheLimit();
+
         return withContentKey as any;
       });
 
       const subscription = observable.subscribe({
         next: (
-          newResults: Array<StoreRecord<StoreSchema> & { _contentKey: string }>
+          newResults: Array<
+            StoreRecord<
+              S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+            > & { _contentKey: string }
+          >
         ) => {
           setObjects((previousResults) => {
             if (previousResults.length !== newResults.length)
@@ -567,7 +671,6 @@ export function createIDBStore<StoreSchema = any>(
             const prevMap: Record<number, string> = Object.fromEntries(
               previousResults.map((r) => [r.id, contentKeyFor(r.object)])
             );
-
             for (const newRec of newResults) {
               const prevKey = prevMap[newRec.id];
               if (prevKey === undefined) {
@@ -593,6 +696,280 @@ export function createIDBStore<StoreSchema = any>(
     return objects;
   };
 
+  const useRecord = <S extends SelectClause<StoreSchema> | undefined>({
+    where,
+    select,
+    onError,
+  }: {
+    where: WhereClause<StoreSchema>;
+    select?: S;
+    onError?: (error: Error) => void;
+  }) => {
+    const [object, setObject] = useState<StoreRecord<
+      S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+    > | null>(null);
+
+    // memoized normalized where string (deterministic)
+    const normalizedWhere = useMemo(() => normalizeWhere(where), [where]);
+
+    useEffect(() => {
+      const observable = liveQuery(async () => {
+        const queryKey = makeQueryKey(where, select);
+
+        const record = await collection
+          .toCollection()
+          .filter((item) => evaluateCondition(item.object, where))
+          .first();
+
+        if (!record) return null;
+
+        const selectedObject = applySelect(record.object, select);
+        const key = contentKeyFor(selectedObject);
+
+        const wrapped = {
+          ...record,
+          object: selectedObject,
+          _contentKey: key,
+        } as any;
+
+        const cached = queryResultCache.get(queryKey);
+        if (cached && cached.contentKey === key) {
+          cached.lastUsed = Date.now();
+          return cached.result;
+        }
+
+        const entry: CacheEntry = {
+          contentKey: key,
+          result: wrapped,
+          lastUsed: Date.now(),
+        };
+        queryResultCache.set(queryKey, entry);
+        ensureCacheLimit();
+
+        return wrapped;
+      });
+
+      const subscription = observable.subscribe({
+        next: (
+          newResult:
+            | (StoreRecord<
+                S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+              > & { _contentKey: string })
+            | null
+        ) => {
+          setObject((previousResult) => {
+            // null handling
+            if (!previousResult && !newResult) return null;
+            if (!previousResult && newResult) {
+              const { _contentKey, ...rest } = newResult;
+              return rest;
+            }
+            if (previousResult && !newResult) return null;
+
+            // both exist = compare content key
+            const prevKey = contentKeyFor(previousResult!.object);
+            if (prevKey !== newResult!._contentKey) {
+              const { _contentKey, ...rest } = newResult!;
+              return rest;
+            }
+
+            return previousResult;
+          });
+        },
+        error: (err: any) => {
+          console.error(`Error in liveQuery for ${name}:`, err);
+          onError?.(err);
+          setObject(null);
+        },
+      });
+
+      return () => subscription.unsubscribe();
+    }, [name, normalizedWhere]);
+
+    return object;
+  };
+
+  const useFirstRecord = <S extends SelectClause<StoreSchema> | undefined>({
+    where,
+    select,
+    onError,
+  }: {
+    where: WhereClause<StoreSchema>;
+    select?: S;
+    onError?: (error: Error) => void;
+  }) => {
+    const [object, setObject] = useState<StoreRecord<
+      S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+    > | null>(null);
+
+    const normalizedWhere = useMemo(() => normalizeWhere(where), [where]);
+
+    useEffect(() => {
+      const observable = liveQuery(async () => {
+        const queryKey = makeQueryKey(where, select);
+
+        const record = await collection
+          .toCollection()
+          .filter((item) => evaluateCondition(item.object, where))
+          .first();
+
+        if (!record) return null;
+
+        const selectedObject = applySelect(record.object, select);
+        const key = contentKeyFor(selectedObject);
+
+        const wrapped = {
+          ...record,
+          object: selectedObject,
+          _contentKey: key,
+        } as any;
+
+        const cached = queryResultCache.get(queryKey);
+        if (cached && cached.contentKey === key) {
+          cached.lastUsed = Date.now();
+          return cached.result;
+        }
+
+        const entry: CacheEntry = {
+          contentKey: key,
+          result: wrapped,
+          lastUsed: Date.now(),
+        };
+        queryResultCache.set(queryKey, entry);
+        ensureCacheLimit();
+
+        return wrapped;
+      });
+
+      const subscription = observable.subscribe({
+        next: (
+          newResult:
+            | (StoreRecord<
+                S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+              > & { _contentKey: string })
+            | null
+        ) => {
+          setObject((previousResult) => {
+            if (!previousResult && !newResult) return null;
+            if (!previousResult && newResult) {
+              const { _contentKey, ...rest } = newResult;
+              return rest;
+            }
+            if (previousResult && !newResult) return null;
+
+            const prevKey = contentKeyFor(previousResult!.object);
+            if (prevKey !== newResult!._contentKey) {
+              const { _contentKey, ...rest } = newResult!;
+              return rest;
+            }
+
+            return previousResult;
+          });
+        },
+        error: (err: any) => {
+          console.error(`Error in liveQuery for ${name}:`, err);
+          onError?.(err);
+          setObject(null);
+        },
+      });
+
+      return () => subscription.unsubscribe();
+    }, [name, normalizedWhere]);
+
+    return object;
+  };
+
+  const useLastRecord = <S extends SelectClause<StoreSchema> | undefined>({
+    where,
+    select,
+    onError,
+  }: {
+    where: WhereClause<StoreSchema>;
+    select?: S;
+    onError?: (error: Error) => void;
+  }) => {
+    const [object, setObject] = useState<StoreRecord<
+      S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+    > | null>(null);
+
+    const normalizedWhere = useMemo(() => normalizeWhere(where), [where]);
+
+    useEffect(() => {
+      const observable = liveQuery(async () => {
+        const queryKey = makeQueryKey(where, select);
+
+        const record = await collection
+          .toCollection()
+          .reverse()
+          .filter((item) => evaluateCondition(item.object, where))
+          .first();
+
+        if (!record) return null;
+
+        const selectedObject = applySelect(record.object, select);
+        const key = contentKeyFor(selectedObject);
+
+        const wrapped = {
+          ...record,
+          object: selectedObject,
+          _contentKey: key,
+        } as any;
+
+        const cached = queryResultCache.get(queryKey);
+        if (cached && cached.contentKey === key) {
+          cached.lastUsed = Date.now();
+          return cached.result;
+        }
+
+        const entry: CacheEntry = {
+          contentKey: key,
+          result: wrapped,
+          lastUsed: Date.now(),
+        };
+        queryResultCache.set(queryKey, entry);
+        ensureCacheLimit();
+
+        return wrapped;
+      });
+
+      const subscription = observable.subscribe({
+        next: (
+          newResult:
+            | (StoreRecord<
+                S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>
+              > & { _contentKey: string })
+            | null
+        ) => {
+          setObject((previousResult) => {
+            if (!previousResult && !newResult) return null;
+            if (!previousResult && newResult) {
+              const { _contentKey, ...rest } = newResult;
+              return rest;
+            }
+            if (previousResult && !newResult) return null;
+
+            const prevKey = contentKeyFor(previousResult!.object);
+            if (prevKey !== newResult!._contentKey) {
+              const { _contentKey, ...rest } = newResult!;
+              return rest;
+            }
+
+            return previousResult;
+          });
+        },
+        error: (err: any) => {
+          console.error(`Error in liveQuery for ${name}:`, err);
+          onError?.(err);
+          setObject(null);
+        },
+      });
+
+      return () => subscription.unsubscribe();
+    }, [name, normalizedWhere]);
+
+    return object;
+  };
+
   return {
     collection,
     addItem,
@@ -608,5 +985,8 @@ export function createIDBStore<StoreSchema = any>(
     deleteManyWhere,
     addMany,
     useRecords,
+    useRecord,
+    useFirstRecord,
+    useLastRecord,
   };
 }
