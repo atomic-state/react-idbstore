@@ -391,6 +391,28 @@ export function createIDBStore<StoreSchema = any>(
     })) as any;
   };
 
+  /**
+   * Finds many records matching a criteria and returns the array of 'object' fields (the StoreSchema)
+   * instead of the full StoreRecord ({ id, object }).
+   */
+  const findManyFlat = async <
+    S extends SelectClause<StoreSchema> | undefined
+  >(params: {
+    where: WhereClause<StoreSchema>;
+    select?: S;
+  }): Promise<
+    Array<S extends undefined ? StoreSchema : ApplySelect<StoreSchema, S>>
+  > => {
+    const { where, select } = params;
+
+    const records = await collection
+      .toCollection()
+      .filter((item) => evaluateCondition(item.object, where))
+      .toArray();
+
+    return records.map((r) => applySelect(r.object, select)) as any;
+  };
+
   const addItem = async (item: StoreSchema) => {
     const data: StoreRecord<StoreSchema> = {
       object: item,
@@ -691,7 +713,119 @@ export function createIDBStore<StoreSchema = any>(
       });
 
       return () => subscription.unsubscribe();
-    }, [name, normalizedWhere]);
+    }, [name, normalizedWhere, select]); // Added 'select' to dependency array for correctness
+
+    return objects;
+  };
+
+  /**
+   * Same as useRecords, but returns an array of the 'object' field (the StoreSchema)
+   * instead of the full StoreRecord ({ id, object }).
+   */
+  const useRecordsFlat = <S extends SelectClause<StoreSchema> | undefined>({
+    where,
+    select,
+    onError,
+  }: {
+    where?: WhereClause<StoreSchema>;
+    select?: S;
+    onError?: (error: Error) => void;
+  } = {}) => {
+    type FlatObject = S extends undefined
+      ? StoreSchema
+      : ApplySelect<StoreSchema, S>;
+
+    const [objects, setObjects] = useState<Array<FlatObject>>([]);
+
+    // memoized normalized where string (deterministic)
+    const normalizedWhere = useMemo(() => normalizeWhere(where), [where]);
+
+    useEffect(() => {
+      const observable = liveQuery(async () => {
+        const queryKey = makeQueryKey(where, select);
+
+        let query: Collection<
+          StoreRecord<StoreSchema>,
+          number
+        > = collection.toCollection();
+        if (where && Object.keys(where as any).length > 0) {
+          query = query.filter((item) => evaluateCondition(item.object, where));
+        }
+        const results = await query.toArray();
+
+        // Prepare compact content keys using djb2Hash32 over sorted JSON
+        const withContentKey = results.map((r) => {
+          const selectedObject = applySelect(r.object, select);
+          const key = contentKeyFor(selectedObject);
+
+          // We return the flat object and its content key for comparison
+          return {
+            object: selectedObject as FlatObject,
+            id: r.id, // Keep ID for mapping to previous results
+            _contentKey: key,
+          };
+        });
+
+        // Compute combined content key for whole result set
+        const combined = djb2Hash32(
+          withContentKey.map((r) => r._contentKey).join("|")
+        );
+
+        // Check cache
+        const cached = queryResultCache.get(queryKey);
+        // Note: For useRecordsFlat, the cached result is already the flat array
+        if (cached && cached.contentKey === combined) {
+          // update lastUsed and return same reference
+          cached.lastUsed = Date.now();
+          return cached.result;
+        }
+
+        // The result to be returned and cached is the array of flat objects
+        const flatResults = withContentKey.map((r) => r.object);
+
+        // Not cached or stale → set cache
+        const entry: CacheEntry = {
+          contentKey: combined,
+          result: flatResults, // Cache the flat array
+          lastUsed: Date.now(),
+        };
+        queryResultCache.set(queryKey, entry);
+        ensureCacheLimit();
+
+        // Return the flat array for immediate use by the component (which will be a new reference)
+        return flatResults as Array<FlatObject>;
+      });
+
+      const subscription = observable.subscribe({
+        next: (newResults: Array<FlatObject>) => {
+          setObjects((previousResults) => {
+            // The content comparison logic is more complex for flat arrays without content keys.
+            // We perform a deep compare as a final check to prevent re-renders on identical content,
+            // in case the cache or change detection failed to return the same reference.
+
+            if (previousResults === newResults) return previousResults; // Should be caught by cache
+            if (previousResults.length !== newResults.length) return newResults;
+
+            let needsUpdate = false;
+            for (let i = 0; i < previousResults.length; i++) {
+              if (!robustJsonCompare(previousResults[i], newResults[i])) {
+                needsUpdate = true;
+                break;
+              }
+            }
+
+            return needsUpdate ? newResults : previousResults;
+          });
+        },
+        error: (err: any) => {
+          console.error(`Error in liveQuery for ${name}:`, err);
+          onError?.(err);
+          setObjects([]);
+        },
+      });
+
+      return () => subscription.unsubscribe();
+    }, [name, normalizedWhere, select]);
 
     return objects;
   };
@@ -784,7 +918,7 @@ export function createIDBStore<StoreSchema = any>(
       });
 
       return () => subscription.unsubscribe();
-    }, [name, normalizedWhere]);
+    }, [name, normalizedWhere, select]); // Added 'select' to dependency array for correctness
 
     return object;
   };
@@ -874,7 +1008,7 @@ export function createIDBStore<StoreSchema = any>(
       });
 
       return () => subscription.unsubscribe();
-    }, [name, normalizedWhere]);
+    }, [name, normalizedWhere, select]); // Added 'select' to dependency array for correctness
 
     return object;
   };
@@ -965,7 +1099,7 @@ export function createIDBStore<StoreSchema = any>(
       });
 
       return () => subscription.unsubscribe();
-    }, [name, normalizedWhere]);
+    }, [name, normalizedWhere, select]); // Added 'select' to dependency array for correctness
 
     return object;
   };
@@ -974,6 +1108,7 @@ export function createIDBStore<StoreSchema = any>(
     collection,
     addItem,
     findMany,
+    findManyFlat,
     findFirst,
     findLast,
     updateItem,
@@ -985,6 +1120,7 @@ export function createIDBStore<StoreSchema = any>(
     deleteManyWhere,
     addMany,
     useRecords,
+    useRecordsFlat,
     useRecord,
     useFirstRecord,
     useLastRecord,
