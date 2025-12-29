@@ -1,6 +1,6 @@
 {
   "name": "react-idbstore",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "IndexedDB stores for React made easy.",
   "main": "./index.js",
   "repository": {
@@ -10,7 +10,7 @@
   "author": "Dany Beltran",
   "license": "MIT",
   "homepage": "https://github.com/atomic-state/react-idbstore",
-  "dependencies": {
-    "dexie": "^4.2.1"
+  "peerDependencies": {
+    "dexie": "^4.2.0"
   }
 }
